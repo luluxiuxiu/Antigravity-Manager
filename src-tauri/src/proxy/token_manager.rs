@@ -2,6 +2,7 @@ use dashmap::DashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use crate::proxy::token_refresher::TokenRefresher;
 
 #[derive(Debug, Clone)]
 pub struct ProxyToken {
@@ -20,6 +21,8 @@ pub struct TokenManager {
     tokens: Arc<DashMap<String, ProxyToken>>,  // account_id -> ProxyToken
     current_index: Arc<AtomicUsize>,
     data_dir: PathBuf,
+    /// Token 自动刷新器
+    refresher: Option<TokenRefresher>,
 }
 
 impl TokenManager {
@@ -29,6 +32,7 @@ impl TokenManager {
             tokens: Arc::new(DashMap::new()),
             current_index: Arc::new(AtomicUsize::new(0)),
             data_dir,
+            refresher: None,
         }
     }
     
@@ -265,6 +269,60 @@ impl TokenManager {
         self.tokens.len()
     }
     
+    /// 获取所有 Token 的克隆列表
+    /// 用于 TokenRefresher 遍历检查
+    pub fn get_all_tokens(&self) -> Vec<ProxyToken> {
+        self.tokens.iter().map(|entry| entry.value().clone()).collect()
+    }
+
+    /// 更新指定账号的 Token
+    /// 
+    /// # 参数
+    /// - `account_id`: 账号 ID
+    /// - `token_response`: 新的 Token 响应
+    pub async fn update_token(
+        &self,
+        account_id: &str,
+        token_response: &crate::modules::oauth::TokenResponse,
+    ) -> Result<(), String> {
+        let now = chrono::Utc::now().timestamp();
+        
+        // 更新内存中的 Token
+        if let Some(mut entry) = self.tokens.get_mut(account_id) {
+            entry.access_token = token_response.access_token.clone();
+            entry.expires_in = token_response.expires_in;
+            entry.timestamp = now + token_response.expires_in;
+        } else {
+            return Err(format!("账号 {} 不存在", account_id));
+        }
+
+        // 保存到文件
+        self.save_refreshed_token(account_id, token_response).await
+    }
+
+    /// 启动 Token 自动刷新任务
+    /// 
+    /// # 参数
+    /// - `self_arc`: TokenManager 的 Arc 引用（用于传递给刷新器）
+    pub fn start_auto_refresh(&mut self, self_arc: Arc<TokenManager>) {
+        if self.refresher.is_some() {
+            tracing::warn!("Token 自动刷新任务已在运行");
+            return;
+        }
+
+        let refresher = TokenRefresher::with_defaults();
+        refresher.start(self_arc);
+        self.refresher = Some(refresher);
+        tracing::info!("Token 自动刷新任务已启动");
+    }
+
+    /// 停止 Token 自动刷新任务
+    pub fn stop_auto_refresh(&mut self) {
+        if let Some(refresher) = self.refresher.take() {
+            refresher.stop();
+            tracing::info!("Token 自动刷新任务已停止");
+        }
+    }
 
 }
 

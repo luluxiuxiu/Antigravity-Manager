@@ -148,7 +148,9 @@
             "batch_refresh_title": "Batch Refresh",
             "refresh_msg": "Are you sure you want to refresh the quota for the current account?",
             "batch_refresh_msg": "Are you sure you want to refresh quotas for the selected {{count}} accounts? This may take some time."
-        }
+        },
+        "auto_refresh_tooltip": "Quota auto-refreshes every 5 minutes",
+        "auto_refreshing": "Refreshing..."
     },
     "settings": {
         "save": "Save Settings",

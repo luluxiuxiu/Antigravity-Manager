@@ -2,7 +2,7 @@ import { useState, useEffect, useMemo } from 'react';
 import { save } from '@tauri-apps/plugin-dialog';
 import { invoke } from '@tauri-apps/api/core';
 import { join } from '@tauri-apps/api/path';
-import { Search, RefreshCw, Download, Trash2, LayoutGrid, List } from 'lucide-react';
+import { Search, RefreshCw, Download, Trash2, LayoutGrid, List, Clock } from 'lucide-react';
 import { useAccountStore } from '../stores/useAccountStore';
 import { useConfigStore } from '../stores/useConfigStore';
 import AccountTable from '../components/accounts/AccountTable';
@@ -30,6 +30,10 @@ function Accounts() {
         switchAccount,
         loading,
         refreshQuota,
+        startAutoRefresh,
+        stopAutoRefresh,
+        isAutoRefreshing,
+        lastAutoRefreshTime,
     } = useAccountStore();
     const { config } = useConfigStore();
 
@@ -47,6 +51,13 @@ function Accounts() {
 
     useEffect(() => {
         fetchAccounts();
+        // 启动定时刷新配额
+        startAutoRefresh();
+        
+        // 组件卸载时停止定时刷新
+        return () => {
+            stopAutoRefresh();
+        };
     }, []);
 
     // Reset pagination when view mode changes to avoid empty pages or confusion
@@ -414,6 +425,16 @@ function Accounts() {
                 </div>
 
                 <div className="flex-1"></div>
+
+                {/* 自动刷新状态指示器 */}
+                {lastAutoRefreshTime && (
+                    <div className="flex items-center gap-1.5 px-2 py-1 bg-gray-50 dark:bg-base-200 rounded-lg" title={t('accounts.auto_refresh_tooltip')}>
+                        <Clock className={`w-3.5 h-3.5 ${isAutoRefreshing ? 'text-emerald-500 animate-pulse' : 'text-gray-400'}`} />
+                        <span className="text-[10px] text-gray-500 dark:text-gray-400 font-mono">
+                            {isAutoRefreshing ? t('accounts.auto_refreshing') : new Date(lastAutoRefreshTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                        </span>
+                    </div>
+                )}
 
                 {/* 操作按钮组 */}
                 <div className="flex items-center gap-2">

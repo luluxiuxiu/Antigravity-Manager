@@ -32,3 +32,5 @@ src-tauri/.env
 .env
 .env.*
 environment/
+Antigravity2Api-main/
+.kiro/

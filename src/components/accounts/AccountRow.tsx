@@ -21,6 +21,7 @@ import { useTranslation } from 'react-i18next';
 function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSwitching = false, onSwitch, onRefresh, onViewDetails, onExport, onDelete }: AccountRowProps) {
     const { t } = useTranslation();
     const geminiModel = account.quota?.models.find(m => m.name.toLowerCase() === 'gemini-3-pro-high');
+    const geminiFlashModel = account.quota?.models.find(m => m.name.toLowerCase() === 'gemini-3-flash');
     const geminiImageModel = account.quota?.models.find(m => m.name.toLowerCase() === 'gemini-3-pro-image');
     const claudeModel = account.quota?.models.find(m => m.name.toLowerCase() === 'claude-sonnet-4-5');
 
@@ -94,6 +95,31 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
                                     {geminiModel.reset_time && (
                                         <div className="text-[10px] text-gray-400 dark:text-gray-500 font-mono" title={`${t('accounts.reset_time')}: ${new Date(geminiModel.reset_time).toLocaleString()}`}>
                                             R: {formatTimeRemaining(geminiModel.reset_time)}
+                                        </div>
+                                    )}
+                                </>
+                            ) : (
+                                <span className="text-xs text-gray-400 dark:text-gray-500 flex-1">无数据</span>
+                            )}
+                        </div>
+
+                        {/* Gemini 3 Flash */}
+                        <div className="flex items-center gap-2">
+                            <div className="w-32 text-xs font-medium text-gray-500 dark:text-gray-400">Gemini 3 Flash</div>
+                            {geminiFlashModel ? (
+                                <>
+                                    <div className="w-24 h-1 bg-gray-100 dark:bg-base-300 rounded-full overflow-hidden">
+                                        <div
+                                            className={`h-full ${getColorClass(geminiFlashModel.percentage)} rounded-full`}
+                                            style={{ width: `${geminiFlashModel.percentage}%` }}
+                                        />
+                                    </div>
+                                    <div className="w-8 text-xs text-right text-gray-700 dark:text-gray-300 font-bold font-mono">
+                                        {geminiFlashModel.percentage}%
+                                    </div>
+                                    {geminiFlashModel.reset_time && (
+                                        <div className="text-[10px] text-gray-400 dark:text-gray-500 font-mono" title={`${t('accounts.reset_time')}: ${new Date(geminiFlashModel.reset_time).toLocaleString()}`}>
+                                            R: {formatTimeRemaining(geminiFlashModel.reset_time)}
                                         </div>
                                     )}
                                 </>

@@ -3,6 +3,10 @@ use reqwest::Client;
 use eventsource_stream::Eventsource;
 use futures::StreamExt;
 use crate::proxy::converter;
+use crate::proxy::retry_handler::RetryDelayParser;
+use crate::proxy::config_builder;
+use crate::proxy::model_mapper::ModelMapper;
+use crate::proxy::signature_manager::SignatureManager;
 use uuid::Uuid;
 
 /// Antigravity API 客户端
@@ -28,7 +32,8 @@ impl GeminiClient {
         project_id: &str,
         session_id: &str,
         model_mapping: &std::collections::HashMap<String, String>,
-        signature_map: Arc<tokio::sync::Mutex<std::collections::HashMap<String, String>>>, // 新增
+        signature_map: Arc<tokio::sync::Mutex<std::collections::HashMap<String, String>>>, // 保留以兼容现有代码
+        signature_manager: Option<Arc<SignatureManager>>, // 新增：SignatureManager
     ) -> Result<impl futures::Stream<Item = Result<String, String>>, String> {
          // 使用 Antigravity 内部 API
         let url = "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:streamGenerateContent?alt=sse";
@@ -49,57 +54,26 @@ impl GeminiClient {
             })
         };
 
-        // Generation Config
-        let mut generation_config = serde_json::json!({
-            "temperature": anthropic_request.temperature.unwrap_or(1.0),
-            "topP": anthropic_request.top_p.unwrap_or(0.95),
-            "maxOutputTokens": anthropic_request.max_tokens.unwrap_or(16384), // 平衡型配置
-            "candidateCount": 1,
+        // 使用 ModelMapper 进行模型映射
+        let model_mapper = ModelMapper::new(model_mapping.clone());
+        
+        // 检查是否有 web_search 工具（从请求的 tools 中提取）
+        let tools_json: Option<Vec<serde_json::Value>> = anthropic_request.tools.as_ref().map(|tools| {
+            tools.iter().map(|t| serde_json::json!({"name": &t.name})).collect()
         });
-
-        // 注入 Thinking Config (参考 neovate-code)
-        // 只有支持思维链的模型才注入，这里简化为判断是否包含 sonnet 或 thinking 字样
-        if model_name.contains("sonnet-3-7") || model_name.contains("thinking") || model_name.contains("claude-3-7") {
-             if let Some(config) = generation_config.as_object_mut() {
-                config.insert("thinkingConfig".to_string(), serde_json::json!({
-                    "includeThoughts": true,
-                    "thinkingBudget": 8191, // Google Protocol Limit < 8192, 8191 is max safe value
-                }));
-            }
+        
+        // 使用 ModelMapper 映射模型名，考虑 web_search 工具强制
+        let upstream_model = model_mapper.map_model_with_tools(&model_name, tools_json.as_ref());
+        
+        if upstream_model != model_name {
+            tracing::info!("(Anthropic) 模型映射: {} -> {}", model_name, upstream_model);
         }
 
-        // 映射模型名 (Anthropic 模型名 -> Gemini 模型名，暂时直通或简单映射)
-        // Claude Code 可能会传 "claude-3-5-sonnet-20240620" 等
-        // 目前策略：尝试匹配 gemini 模型，或者默认使用 gemini-3-pro-low 如果传的是 anthropic 名字
-        // 鲁棒模糊映射机制 (参考 CLIProxyAPI 经验)
-        let initial_mapped = if let Some(mapped) = model_mapping.get(&model_name) {
-            tracing::info!("(Anthropic) 基础映射: {} -> {}", model_name, mapped);
-            mapped.as_str()
-        } else {
-            model_name.as_str()
-        };
-
-        let lower_name = initial_mapped.to_lowercase();
-        // 最终 API 型号转换：将内部型号转换为 Antigravity Daily API 实际支持的名称
-        // 参考 CLIProxyAPI 的 modelName2Alias 函数
-        let upstream_model = if lower_name == "gemini-3-flash" {
-            "gemini-3-flash-preview"
-        } else if lower_name == "gemini-3-pro-high" {
-            "gemini-3-pro-preview"
-        } else if lower_name.starts_with("gemini-") {
-             initial_mapped
-        } else if lower_name.contains("thinking") {
-             // 如果映射结果本身包含 thinking (如 claude-sonnet-4-5-thinking)，尝试直接透传
-             initial_mapped
-        } else if lower_name.contains("opus") {
-            "gemini-3-pro-preview" // 修正: High -> Preview
-        } else {
-            initial_mapped
-        };
-
-        if upstream_model != initial_mapped {
-            tracing::info!("(Anthropic) 模型 API 转换: {} -> {}", initial_mapped, upstream_model);
-        }
+        // 使用 config_builder 构建 generationConfig (包含 thinkingConfig 注入)
+        let generation_config = config_builder::build_generation_config(anthropic_request, &upstream_model);
+        
+        // 构建 safetySettings
+        let safety_settings = config_builder::build_safety_settings();
 
         let request_body = serde_json::json!({
             "project": project_id,
@@ -110,6 +84,7 @@ impl GeminiClient {
                 "contents": contents,
                 "systemInstruction": system_instruction,
                 "generationConfig": generation_config,
+                "safetySettings": safety_settings,
                 // ✅ 移除 toolConfig 以避免 MALFORMED_FUNCTION_CALL 错误
                 // "toolConfig": {
                 //     "functionCallingConfig": {
@@ -197,11 +172,15 @@ impl GeminiClient {
         
         let _msg_id = format!("msg_{}", Uuid::new_v4());
         let _created_model = model_name.clone();
+        
+        // 克隆 signature_manager 用于流处理
+        let sig_manager = signature_manager.clone();
 
         let stream = response.bytes_stream()
             .eventsource()
             .flat_map(move |result| {
                  let sig_map = Arc::clone(&signature_map);
+                 let sig_mgr = sig_manager.clone();
                  match result {
                     Ok(event) => {
                         let data = event.data;
@@ -285,15 +264,24 @@ impl GeminiClient {
                         let is_thought = part.and_then(|p| p.get("thought")).and_then(|t| t.as_bool()).unwrap_or(false);
                         let thought_signature = part.and_then(|p| p.get("thoughtSignature")).and_then(|s| s.as_str());
                         
-                        // 捕获 thoughtSignature 并存入 map (参考 endsock gist)
+                        // 捕获 thoughtSignature 并存入 SignatureManager 和兼容的 map
                         if let Some(sig) = thought_signature {
+                            // 使用 SignatureManager 存储签名（如果可用）
+                            if let Some(ref mgr) = sig_mgr {
+                                let key = json.get("responseId")
+                                    .and_then(|s| s.as_str())
+                                    .unwrap_or("latest");
+                                mgr.store_signature(key, sig);
+                                tracing::debug!("(Anthropic) 捕获到 thoughtSignature 并已存入 SignatureManager");
+                            }
+                            
+                            // 同时存入兼容的 map（保持向后兼容）
                             let mut map = futures::executor::block_on(sig_map.lock());
                             if let Some(resp_id) = json.get("responseId").and_then(|s| s.as_str()) {
                                 map.insert(resp_id.to_string(), sig.to_string());
                             } else {
                                 map.insert("latest".to_string(), sig.to_string());
                             }
-                            tracing::debug!("(Anthropic) 捕获到 thoughtSignature 并已暂存");
                         }
 
                         // ✅ 方案更新：只有在有实际内容或结束原因时才发送 chunk
@@ -301,12 +289,12 @@ impl GeminiClient {
                         let has_content = !text.is_empty() || is_thought || thought_signature.is_some();
                         
                         if !has_content {
-                            if let Some(reason) = finish_reason.as_deref() {
-                                if reason == "length" || reason == "stop" { 
-                                     // 关键：如果没内容就结束了 (MAX_TOKENS 或 STOP)，视为失败，抛出错误触发重试
-                                    tracing::warn!("(Anthropic) 检测到空响应且原因为 {}, 触发重试...", reason);
-                                    return futures::stream::iter(vec![Err(format!("Gemini 返回空内容 ({})", reason))]);
-                                }
+                            // 使用 RetryDelayParser 检查是否应该因为空响应而重试
+                            if RetryDelayParser::should_retry_empty_response(text, finish_reason) {
+                                // 关键：如果没内容就结束了 (MAX_TOKENS 或 STOP)，视为失败，抛出错误触发重试
+                                let reason_str = finish_reason.unwrap_or("unknown");
+                                tracing::warn!("(Anthropic) 检测到空响应且原因为 {}, 触发重试...", reason_str);
+                                return futures::stream::iter(vec![Err(format!("Gemini 返回空内容 ({})", reason_str))]);
                             }
                             
                             if finish_reason.is_none() {

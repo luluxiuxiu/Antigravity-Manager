@@ -148,7 +148,9 @@
             "batch_refresh_title": "批量刷新",
             "refresh_msg": "确定要刷新当前账号的配额吗？",
             "batch_refresh_msg": "确定要刷新选中的 {{count}} 个账号的配额吗？这可能需要一些时间。"
-        }
+        },
+        "auto_refresh_tooltip": "配额每 5 分钟自动刷新一次",
+        "auto_refreshing": "刷新中..."
     },
     "settings": {
         "save": "保存设置",

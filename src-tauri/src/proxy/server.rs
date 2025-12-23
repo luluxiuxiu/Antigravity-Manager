@@ -9,7 +9,7 @@ use axum::{
 use std::sync::Arc;
 use tokio::sync::oneshot;
 use futures::stream::StreamExt;
-use crate::proxy::{TokenManager, converter, client::GeminiClient};
+use crate::proxy::{TokenManager, TokenRefresher, SignatureManager, converter, client::GeminiClient, retry_handler::{RetryDelayParser, RetryAction}};
 
 /// Axum 应用状态
 #[derive(Clone)]
@@ -17,7 +17,8 @@ pub struct AppState {
     pub token_manager: Arc<TokenManager>,
     pub anthropic_mapping: Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>,
     pub request_timeout: u64,  // API 请求超时(秒)
-    pub thought_signature_map: Arc<tokio::sync::Mutex<std::collections::HashMap<String, String>>>, // 思维链签名映射 (ID -> Signature)
+    pub thought_signature_map: Arc<tokio::sync::Mutex<std::collections::HashMap<String, String>>>, // 思维链签名映射 (ID -> Signature) - 保留以兼容现有代码
+    pub signature_manager: Arc<SignatureManager>, // 新的签名管理器
     pub upstream_proxy: Arc<tokio::sync::RwLock<crate::proxy::config::UpstreamProxyConfig>>,
 }
 
@@ -26,6 +27,8 @@ pub struct AxumServer {
     shutdown_tx: Option<oneshot::Sender<()>>,
     mapping_state: Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>,
     proxy_state: Arc<tokio::sync::RwLock<crate::proxy::config::UpstreamProxyConfig>>,
+    /// Token 自动刷新器
+    token_refresher: Option<TokenRefresher>,
 }
 
 impl AxumServer {
@@ -53,11 +56,22 @@ impl AxumServer {
         let mapping_state = Arc::new(tokio::sync::RwLock::new(anthropic_mapping));
         let proxy_state = Arc::new(tokio::sync::RwLock::new(upstream_proxy));
 
+        // 创建签名管理器
+        let signature_manager = Arc::new(SignatureManager::with_defaults());
+
+        // 启动 Token 自动刷新任务（带签名清理）
+        let token_refresher = TokenRefresher::with_defaults();
+        token_refresher.start_with_signature_manager(
+            token_manager.clone(),
+            Some(Arc::clone(&signature_manager)),
+        );
+
         let state = AppState {
             token_manager,
             anthropic_mapping: mapping_state.clone(),
             request_timeout,
             thought_signature_map: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            signature_manager,
             upstream_proxy: proxy_state.clone(),
         };
         
@@ -84,6 +98,7 @@ impl AxumServer {
             shutdown_tx: Some(shutdown_tx),
             mapping_state,
             proxy_state,
+            token_refresher: Some(token_refresher),
         };
         
         // 在新任务中启动服务器
@@ -104,6 +119,12 @@ impl AxumServer {
     
     /// 停止服务器
     pub fn stop(mut self) {
+        // 停止 Token 自动刷新任务
+        if let Some(refresher) = self.token_refresher.take() {
+            refresher.stop();
+        }
+        
+        // 停止 HTTP 服务器
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
         }
@@ -397,6 +418,63 @@ fn check_retry_error(error_msg: &str) -> RequestResult {
     ).into_response())
 }
 
+/// 增强版重试检查：支持解析 429 响应中的 retryDelay
+/// 返回 (RequestResult, Option<u64>) - 第二个值是需要等待的毫秒数（如果是短延迟重试）
+fn check_retry_error_enhanced(status: u16, error_msg: &str) -> (RequestResult, Option<u64>) {
+    // 使用 RetryDelayParser 决定重试策略
+    let action = RetryDelayParser::decide_retry_action(status, error_msg);
+    
+    match action {
+        RetryAction::WaitAndRetry(delay_ms) => {
+            tracing::info!("429 短延迟重试: 等待 {}ms 后重试同一账号", delay_ms);
+            (RequestResult::Retry(format!("429 短延迟重试 ({}ms)", delay_ms)), Some(delay_ms))
+        },
+        RetryAction::RotateAccount => {
+            // 404/403/429(长延迟) 都轮换账号
+            let reason = if status == 404 {
+                format!("账号不支持此模型 (404): {}", error_msg)
+            } else if status == 403 {
+                format!("账号无权限 (403): {}", error_msg)
+            } else {
+                format!("配额耗尽或限流 ({}): {}", status, error_msg)
+            };
+            (RequestResult::Retry(reason), None)
+        },
+        RetryAction::NoRetry => {
+            // 其他错误直接返回
+            (RequestResult::Error((
+                StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                Json(serde_json::json!({
+                    "error": {
+                        "message": format!("Antigravity API 错误: {}", error_msg),
+                        "type": "api_error"
+                    }
+                }))
+            ).into_response()), None)
+        }
+    }
+}
+
+/// 从错误消息中提取 HTTP 状态码
+fn extract_status_from_error(error_msg: &str) -> u16 {
+    // 尝试从 "上游服务错误 (429):" 格式中提取
+    if let Some(start) = error_msg.find('(') {
+        if let Some(end) = error_msg[start..].find(')') {
+            if let Ok(status) = error_msg[start+1..start+end].parse::<u16>() {
+                return status;
+            }
+        }
+    }
+    
+    // 回退到关键字检测
+    if error_msg.contains("429") { return 429; }
+    if error_msg.contains("404") { return 404; }
+    if error_msg.contains("403") { return 403; }
+    if error_msg.contains("500") { return 500; }
+    
+    500 // 默认
+}
+
 /// 模型列表处理器
 async fn list_models_handler(
     State(_state): State<AppState>,
@@ -523,6 +601,12 @@ async fn anthropic_messages_handler(
                 },
                 converter::AnthropicContent::Thinking { .. } => {
                     "[Thinking]".to_string()
+                },
+                converter::AnthropicContent::ToolUse { name, .. } => {
+                    format!("[ToolUse: {}]", name)
+                },
+                converter::AnthropicContent::ToolResult { tool_use_id, .. } => {
+                    format!("[ToolResult: {}]", tool_use_id)
                 }
             }
         } else {
@@ -634,7 +718,8 @@ async fn anthropic_messages_handler(
                 project_id,
                 &token.session_id,
                 &mapping_guard,
-                state.thought_signature_map.clone()
+                state.thought_signature_map.clone(),
+                Some(Arc::clone(&state.signature_manager)), // 新增：SignatureManager
             ).await;
             
             match stream_result {
@@ -751,10 +836,21 @@ async fn anthropic_messages_handler(
                     return Sse::new(sse_stream).into_response();
                 },
                 Err(e_msg) => {
-                    let check = check_retry_error(&e_msg);
+                    // 使用增强版重试检查，支持 429 短延迟重试
+                    let status = extract_status_from_error(&e_msg);
+                    let (check, wait_ms) = check_retry_error_enhanced(status, &e_msg);
+                    
                     match check {
                         RequestResult::Retry(reason) => {
-                            tracing::warn!("(Anthropic) 账号 {} 请求失败，重试: {}", token.email, reason);
+                            // 如果是短延迟重试，先等待
+                            if let Some(delay) = wait_ms {
+                                tracing::info!("(Anthropic) 账号 {} 遇到 429，等待 {}ms 后重试同一账号", token.email, delay);
+                                tokio::time::sleep(tokio::time::Duration::from_millis(delay)).await;
+                                // 短延迟重试不增加 attempts 计数，直接重试同一账号
+                                continue;
+                            }
+                            
+                            tracing::warn!("(Anthropic) 账号 {} 请求失败，轮换账号: {}", token.email, reason);
                             if attempts >= max_retries {
                                 return (
                                     StatusCode::TOO_MANY_REQUESTS,
@@ -782,7 +878,8 @@ async fn anthropic_messages_handler(
                 project_id,
                 &token.session_id,
                 &mapping_guard,
-                state.thought_signature_map.clone()
+                state.thought_signature_map.clone(),
+                Some(Arc::clone(&state.signature_manager)), // 新增：SignatureManager
             ).await;
             
             match stream_result {
@@ -813,9 +910,15 @@ async fn anthropic_messages_handler(
                         }
                     }
                     
-                    // 收集完后检查是否为空且为 MAX_TOKENS
-                    if full_text.is_empty() && stop_reason == "max_tokens" {
-                        tracing::warn!("(Anthropic) 非流式：检测到空响应且原因为 MAX_TOKENS，触发重试...");
+                    // 收集完后检查是否为空且为 MAX_TOKENS 或 STOP
+                    // 使用 RetryDelayParser 统一检查逻辑
+                    let gemini_finish_reason = match stop_reason {
+                        "max_tokens" => Some("MAX_TOKENS"),
+                        "end_turn" => Some("STOP"),
+                        _ => None,
+                    };
+                    if RetryDelayParser::should_retry_empty_response(&full_text, gemini_finish_reason) {
+                        tracing::warn!("(Anthropic) 非流式：检测到空响应且原因为 {:?}，触发重试...", gemini_finish_reason);
                         if attempts >= max_retries {
                             // 同上错误返回
                              return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({ "error": { "message": "Max retries exceeded due to empty MAX_TOKENS responses" } }))).into_response();
@@ -857,10 +960,21 @@ async fn anthropic_messages_handler(
                     return (StatusCode::OK, Json(response)).into_response();
                 },
                 Err(e_msg) => {
-                    let check = check_retry_error(&e_msg);
+                    // 使用增强版重试检查，支持 429 短延迟重试
+                    let status = extract_status_from_error(&e_msg);
+                    let (check, wait_ms) = check_retry_error_enhanced(status, &e_msg);
+                    
                     match check {
                         RequestResult::Retry(reason) => {
-                            tracing::warn!("(Anthropic) 账号 {} 请求失败，重试: {}", token.email, reason);
+                            // 如果是短延迟重试，先等待
+                            if let Some(delay) = wait_ms {
+                                tracing::info!("(Anthropic) 账号 {} 遇到 429，等待 {}ms 后重试同一账号", token.email, delay);
+                                tokio::time::sleep(tokio::time::Duration::from_millis(delay)).await;
+                                // 短延迟重试不增加 attempts 计数，直接重试同一账号
+                                continue;
+                            }
+                            
+                            tracing::warn!("(Anthropic) 账号 {} 请求失败，轮换账号: {}", token.email, reason);
                             if attempts >= max_retries {
                                 return (
                                     StatusCode::TOO_MANY_REQUESTS,

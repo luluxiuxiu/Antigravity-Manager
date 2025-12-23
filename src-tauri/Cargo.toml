@@ -51,3 +51,7 @@ rand = "0.8" # 新增：用于生成 sessionId 和 mock project_id
 async-stream = "0.3.6"
 regex = "1.12.2"
 tauri-plugin-single-instance = { version = "2.3.6", features = ["deep-link"] }
+tokio-util = "0.7"  # 用于 CancellationToken
+
+[dev-dependencies]
+proptest = "1.4"  # 用于属性测试
